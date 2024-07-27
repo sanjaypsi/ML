@@ -1,0 +1,153 @@
+import csv
+# import maya.cmds as cmds
+import pandas as pd
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense
+
+# def export_keyframes_to_csv(joint_names, frames, file_path):
+#     with open(file_path, 'w', newline='') as csvfile:
+#         fieldnames = ['Joint Name', 'Frame', 'Translate X', 'Translate Y', 'Translate Z', 'Rotate X', 'Rotate Y', 'Rotate Z']
+#         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+#         writer.writeheader()
+        
+#         for joint in joint_names:
+#             for frame in frames:
+#                 cmds.currentTime(frame)
+#                 pos = cmds.xform(joint, query=True, translation=True, worldSpace=True)
+#                 rot = cmds.xform(joint, query=True, rotation=True, worldSpace=True)
+#                 writer.writerow({
+#                     'Joint Name': joint,
+#                     'Frame': frame,
+#                     'Translate X': pos[0],
+#                     'Translate Y': pos[1],
+#                     'Translate Z': pos[2],
+#                     'Rotate X': rot[0],
+#                     'Rotate Y': rot[1],
+#                     'Rotate Z': rot[2]
+#                 })
+
+# # Example usage
+# joints = cmds.ls(type='joint')
+# frames = [1, 5, 10]  # Including the middle pose at frame 5
+# export_keyframes_to_csv(joints, frames, 'E:/ML/Source/Tensorflow/keyframes_with_middle.csv')
+
+
+# ===================================================================================================================================
+
+
+import pandas as pd
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense
+import csv
+# import maya.cmds as cmds
+
+# Load data
+data = pd.read_csv('E:/ML/Source/Tensorflow/keyframes_with_middle.csv')
+
+# Prepare data
+def prepare_frame_data(data, frame_number):
+    frame_data = data[data['Frame'] == frame_number].drop(columns=['Frame'])
+    joint_names = frame_data['Joint Name'].values
+    numeric_data = frame_data.drop(columns=['Joint Name']).values
+    return joint_names, numeric_data
+
+joint_names_start, start_frame = prepare_frame_data(data, 1)
+joint_names_middle, middle_frame = prepare_frame_data(data, 5)
+joint_names_end, end_frame = prepare_frame_data(data, 10)
+
+# Ensure all the joint names are in the same order
+assert (joint_names_start == joint_names_middle).all() and (joint_names_middle == joint_names_end).all()
+
+# Convert data to float type and check for NaN or infinite values
+start_frame = start_frame.astype(float)
+middle_frame = middle_frame.astype(float)
+end_frame = end_frame.astype(float)
+
+assert not np.isnan(start_frame).any(), "NaN values found in start_frame"
+assert not np.isinf(start_frame).any(), "Infinite values found in start_frame"
+assert not np.isnan(middle_frame).any(), "NaN values found in middle_frame"
+assert not np.isinf(middle_frame).any(), "Infinite values found in middle_frame"
+assert not np.isnan(end_frame).any(), "NaN values found in end_frame"
+assert not np.isinf(end_frame).any(), "Infinite values found in end_frame"
+
+# Concatenate start, middle, and end frames as input features
+input_data = np.concatenate([start_frame, middle_frame, end_frame], axis=1)
+
+# Create model
+model = Sequential([
+    Dense(128, activation='relu', input_shape=(input_data.shape[1],)),
+    Dense(512, activation='relu'),
+    Dense(128, activation='relu'),
+    Dense(start_frame.shape[1])
+])
+
+model.compile(optimizer='adam', loss='mse')
+
+# Train model
+model.fit(input_data, start_frame, epochs=500)
+
+# Predict intermediate frames
+num_intermediate_frames = 8
+interpolated_frames = []
+for i in range(1, num_intermediate_frames + 1):
+    alpha = i / (num_intermediate_frames + 1)
+    beta = (num_intermediate_frames + 1 - i) / (num_intermediate_frames + 1)
+    interpolated_input = np.concatenate([alpha * start_frame + beta * middle_frame, 
+                                         middle_frame, 
+                                         alpha * middle_frame + beta * end_frame], axis=1)
+    interpolated_frame = model.predict(interpolated_input)
+    interpolated_frames.append(interpolated_frame)
+
+# ===================================================================================================================================
+# Save interpolated frames to CSV
+# ===================================================================================================================================
+def save_interpolated_keyframes_to_csv(joint_names, interpolated_frames, start_frame_num, end_frame_num, file_path):
+    frames = range(start_frame_num + 1, end_frame_num)
+    with open(file_path, 'w', newline='') as csvfile:
+        fieldnames = ['Joint Name', 'Frame', 'Translate X', 'Translate Y', 'Translate Z', 'Rotate X', 'Rotate Y', 'Rotate Z']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        
+        for frame_idx, frame in enumerate(frames):
+            for joint_idx, joint in enumerate(joint_names):
+                interpolated_pose = interpolated_frames[frame_idx][joint_idx]
+                writer.writerow({
+                    'Joint Name': joint,
+                    'Frame': frame,
+                    'Translate X': interpolated_pose[0],
+                    'Translate Y': interpolated_pose[1],
+                    'Translate Z': interpolated_pose[2],
+                    'Rotate X': interpolated_pose[3],
+                    'Rotate Y': interpolated_pose[4],
+                    'Rotate Z': interpolated_pose[5]
+                })
+
+# Example usage
+save_interpolated_keyframes_to_csv(joint_names_start, interpolated_frames, 1, 10, 'interpolated_keyframes.csv')
+
+# # # ===================================================================================================================================
+# import csv
+# import maya.cmds as cmds
+
+# def import_keyframes_from_csv(joint_names, file_path):
+#     with open(file_path, 'r') as csvfile:
+#         reader = csv.DictReader(csvfile)
+#         for row in reader:
+#             joint = row['Joint Name']
+#             frame = int(row['Frame'])
+#             pos = [float(row['Translate X']), float(row['Translate Y']), float(row['Translate Z'])]
+#             rot = [float(row['Rotate X']), float(row['Rotate Y']), float(row['Rotate Z'])]
+#             if joint in joint_names:
+#                 cmds.currentTime(frame)
+#                 cmds.xform(joint, translation=pos, worldSpace=True)
+#                 cmds.xform(joint, rotation=rot, worldSpace=True)
+
+# # Example usage
+# joints = cmds.ls(type='joint')
+# import_keyframes_from_csv(joints, '"E:/ML/Source/interpolated_keyframes.csv"')
+
+
