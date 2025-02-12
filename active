@@ -1,0 +1,211 @@
+import time
+import numpy as np
+import cv2
+import pyautogui
+import threading
+import pystray
+import getpass
+import psutil
+import logging
+from PIL import Image, ImageDraw
+from pynput import mouse, keyboard
+from datetime import datetime, timedelta
+from skimage.metrics import structural_similarity as ssim
+
+import connect_to_db  # Import MongoDB connection
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+class InactivityDetector:
+    def __init__(self, total_runtime=3600, timeout=5, check_interval=2, region=None):
+        """Initialize inactivity detector."""
+        self.username = getpass.getuser()
+
+        # ✅ Use MongoDB connection pooling
+        self.db = connect_to_db.MongoDatabase()
+        print(f"Connected to MongoDB: {self.db}")
+
+        # Auto-detect screen resolution
+        screen_width, screen_height = pyautogui.size()
+        self.region = region if region else (
+            int(screen_width * 0.1), int(screen_height * 0.1),
+            int(screen_width * 0.5), int(screen_height * 0.5)
+        )
+
+        self.total_runtime          = total_runtime
+        self.timeout                = timeout
+        self.check_interval         = check_interval
+        self.last_activity_time     = time.time()
+        self.start_time             = time.time()
+        self.active_time            = 0
+        self.inactive_time          = 0
+        self.last_check_time        = self.start_time
+        self.last_screenshot        = None
+        self.running                = True
+        self.active                 = True
+
+        # Mouse & Keyboard Listeners
+        self.mouse_listener = mouse.Listener(
+            on_move=self.on_activity,
+            on_click=self.on_activity,
+            on_scroll=self.on_activity
+        )
+        self.keyboard_listener = keyboard.Listener(on_press=self.on_activity)
+
+    def on_activity(self, *args):
+        """Resets inactivity timer on user activity."""
+        if not self.active:
+            print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - User is active again.")
+            self.active_time += time.time() - self.last_check_time
+            self.active = True
+
+        self.last_activity_time = time.time()
+
+    def take_screenshot(self):
+        """Captures a portion of the screen."""
+        left, top, width, height = self.region
+        return pyautogui.screenshot(region=(left, top, width, height))
+
+    def compare_screenshots(self, img1, img2):
+        """Compares two images using Structural Similarity Index (SSIM)."""
+        if img1 is None or img2 is None:
+            return True, 0  
+
+        img1 = np.array(img1.convert("L"))
+        img2 = np.array(img2.convert("L"))
+
+        similarity = ssim(img1, img2)
+        motion_intensity = (1 - similarity) * 1000  
+
+        return motion_intensity > 300, motion_intensity
+
+    def log_activity(self, status, motion_intensity):
+        """Stores each activity check in MongoDB."""
+        log_entry = {
+            "username": self.username,
+            "timestamp": datetime.now(),
+            "status": status,
+            "motion_intensity": motion_intensity,
+            "active_time": self.active_time,
+            "inactive_time": self.inactive_time
+        }
+
+        try:
+            self.db.insert_logs(log_entry)
+        except Exception as e:
+            print(f"Database Error: {e}")
+
+    def is_user_logged_in(self):
+        """Checks if the current user session is active."""
+        for session in psutil.users():
+            if session.name == self.username:
+                return True
+        return False
+
+    def monitor(self):
+        """Monitors user activity, handles crashes, and pauses on logout/switch user."""
+        self.mouse_listener.start()
+        self.keyboard_listener.start()
+
+        while self.running:
+            if not self.is_user_logged_in():
+                print(f"⚠️ {self.username} has logged out or switched users. Pausing monitoring...")
+                while not self.is_user_logged_in():
+                    time.sleep(5)  # Wait until the user logs back in
+                print(f"✅ {self.username} is back. Resuming monitoring.")
+
+            try:
+                self._monitor_loop()
+            except Exception as e:
+                print(f"⚠️ Error detected: {e}. Restarting monitor in 5 seconds...")
+                time.sleep(5)
+
+    def _monitor_loop(self):
+        """Runs the monitoring logic in a loop."""
+        while time.time() - self.start_time < self.total_runtime and self.running:
+            time_since_last_activity = time.time() - self.last_activity_time
+
+            new_screenshot = self.take_screenshot()
+            motion_detected, motion_intensity = self.compare_screenshots(self.last_screenshot, new_screenshot)
+            self.last_screenshot = new_screenshot
+
+            if motion_detected:
+                self.on_activity()
+
+            elapsed = time.time() - self.last_check_time
+            self.last_check_time = time.time()
+
+            if time_since_last_activity <= self.timeout:
+                self.active_time += elapsed
+                self.active = True
+                status = "Active"
+            else:
+                self.inactive_time += elapsed
+                self.active = False
+                status = "Inactive"
+
+            self.log_activity(status, motion_intensity)
+            print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - User is {status}, Motion Intensity: {motion_intensity}")
+
+            time.sleep(max(0, self.check_interval - (time.time() - self.last_check_time)))
+
+    def print_final_summary(self):
+        """Stores session summary in MongoDB."""
+        total_time = self.active_time + self.inactive_time
+        active_percent = (self.active_time / self.total_runtime) * 100
+        inactive_percent = (self.inactive_time / self.total_runtime) * 100
+
+        summary = {
+            "username": self.username,
+            "session_end": datetime.now(),
+            "total_runtime": self.total_runtime,
+            "active_time": self.active_time,
+            "inactive_time": self.inactive_time,
+            "active_percent": active_percent,
+            "inactive_percent": inactive_percent,
+            "total_time": total_time,
+            "active_duration": str(timedelta(seconds=int(self.active_time))),
+            "inactive_duration": str(timedelta(seconds=int(self.inactive_time)))
+        }
+
+        try:
+            self.db.insert_summary(summary)
+        except Exception as e:
+            print(f"Database Error: {e}")
+
+    def start_monitor_thread(self):
+        """Starts the monitoring process in a separate thread."""
+        self.monitor_thread = threading.Thread(target=self.monitor, daemon=True)
+        self.monitor_thread.start()
+
+    def stop(self):
+        """Stops the monitoring process and prints the final summary."""
+        self.running = False
+        self.print_final_summary()
+
+    def on_quit(self, icon, item):
+        """Callback function to stop the monitoring process."""
+        icon.stop()
+        self.stop()
+    
+    def run(self):
+        """Runs the inactivity detector in the system tray."""
+        icon = pystray.Icon("Inactivity Detector", Image.open("icon.png"), "Inactivity Detector")
+        icon.menu = pystray.Menu(
+            pystray.MenuItem("Quit", self.on_quit)
+        )
+        icon.run()
+    
+
+if __name__ == "__main__":
+    detector = InactivityDetector(
+        total_runtime=60,  
+        timeout=1,  
+        check_interval=1,
+    )
+
+    # Start monitoring in a separate thread
+    monitor_thread = threading.Thread(target=detector.monitor, daemon=True)
+    monitor_thread.start()
+
+    # Keep the main thread alive
+    monitor_thread.join()
