@@ -1,0 +1,204 @@
+import time
+import numpy as np
+import cv2
+import pyautogui
+import os
+from pynput import mouse, keyboard
+from datetime import datetime, timedelta
+import threading
+from skimage.metrics import structural_similarity as ssim
+import pystray
+from PIL import Image, ImageDraw
+
+
+class InactivityDetector:
+    def __init__(self,
+                 total_runtime=3600,
+                 timeout=5,
+                 check_interval=2,
+                 region=None):
+            """
+            Initializes the InactivityDetector object.
+
+            Args:
+                total_runtime (int): The total runtime of the inactivity detector in seconds. Default is 3600 seconds (1 hour).
+                timeout (int): The timeout period in seconds. If no activity is detected within this period, the detector will consider the system inactive. Default is 5 seconds.
+                check_interval (int): The interval at which the detector checks for activity in seconds. Default is 2 seconds.
+                region (tuple): The region of the screen to monitor for activity. If not specified, the default region will be set to 50% of the screen size.
+
+            Returns:
+                None
+            """
+            self.total_runtime  = total_runtime
+            self.timeout        = timeout
+            self.check_interval = check_interval
+
+            # Auto-detect screen resolution
+            screen_width, screen_height = pyautogui.size()
+
+            print(f"Screen resolution: {screen_width}x{screen_height}")
+
+            # Use default region as 50% of screen size if not specified
+            self.region = region if region else (
+                int(screen_width * 0.1),   # Start at 10% from left
+                int(screen_height * 0.1),  # Start at 10% from top
+                int(screen_width * 0.5),   # 50% of screen width
+                int(screen_height * 0.5)   # 50% of screen height
+            )
+
+            self.last_activity_time = time.time()
+            self.active             = True
+            self.start_time         = time.time()
+            self.active_time        = 0
+            self.inactive_time      = 0
+            self.last_check_time    = self.start_time
+            self.last_screenshot    = None
+            self.running            = True
+
+            self.mouse_listener     = mouse.Listener(on_move=self.on_activity, on_click=self.on_activity, on_scroll=self.on_activity)
+            self.keyboard_listener  = keyboard.Listener(on_press=self.on_activity)
+
+    def on_activity(self, *args):
+        """Resets the inactivity timer when user is active."""
+        if not self.active:
+            print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - User is active again.")
+        self.active             = True
+        self.last_activity_time = time.time()
+
+    def take_screenshot(self):
+        """Captures a dynamically adjusted portion of the screen."""
+        left, top, width, height = self.region
+        screenshot               = pyautogui.screenshot(region=(left, top, width, height))
+
+        # Resize for consistency
+        standard_size = (800, 600)
+        return screenshot.resize(standard_size)
+
+    def compare_screenshots(self,
+                            img1,
+                            img2,
+                            threshold=0.95):
+        """Compares two images while ensuring resolution consistency."""
+        if img1 is None or img2 is None:
+            return True, 0  # Assume motion if missing
+
+        # Convert images to grayscale
+        img1_gray = cv2.cvtColor(np.array(img1), cv2.COLOR_RGB2GRAY)
+        img2_gray = cv2.cvtColor(np.array(img2), cv2.COLOR_RGB2GRAY)
+
+        # Compute SSIM and motion intensity
+        score, diff = ssim(img1_gray, img2_gray, full=True)
+        diff = (diff * 255).astype("uint8")
+
+        # Threshold the difference map
+        _, thresh   = cv2.threshold(diff, 200, 255, cv2.THRESH_BINARY)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        motion_area = sum(cv2.contourArea(cnt) for cnt in contours)
+        total_area  = img1_gray.shape[0] * img1_gray.shape[1]
+        motion_intensity = (motion_area / total_area) * 100
+
+        return score < threshold, motion_intensity
+
+    def is_user_logged_in(self):
+        """Checks if the user is logged in (Windows/Linux)."""
+        if os.name == "nt":  # Windows
+            output = os.popen("query session").read()
+            return "Active" in output
+        else:  # Linux (Ubuntu/X11)
+            output = os.popen("who").read()
+            return len(output.strip()) > 0
+
+    def monitor(self):
+        """Monitors user activity and pauses when logged out."""
+        self.mouse_listener.start()
+        self.keyboard_listener.start()
+
+        try:
+            while time.time() - self.start_time < self.total_runtime and self.running:
+                if not self.is_user_logged_in():
+                    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - User logged out. Pausing...")
+                    while not self.is_user_logged_in():
+                        time.sleep(5)
+                    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - User logged in. Resuming...")
+                    self.last_activity_time = time.time()  # Prevents false inactivity
+
+                time_since_last_activity = time.time() - self.last_activity_time
+
+                # Check screen motion
+                new_screenshot = self.take_screenshot()
+                motion_detected, motion_intensity = self.compare_screenshots(self.last_screenshot, new_screenshot)
+                self.last_screenshot = new_screenshot
+
+                if motion_detected:
+                    self.on_activity()
+
+                # Track active/inactive time
+                elapsed = time.time() - self.last_check_time
+                self.last_check_time = time.time()
+
+                if time_since_last_activity <= self.timeout:
+                    self.active_time += elapsed
+                    self.active = True
+                    status      = "Active"
+                else:
+                    self.inactive_time += elapsed
+                    self.active = False
+                    status      = "Inactive"
+
+                print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - User is {status} (Motion: {motion_intensity:.2f}%)")
+
+                time.sleep(self.check_interval)
+
+        except KeyboardInterrupt:
+            print("Stopping inactivity detector.")
+        finally:
+            self.mouse_listener.stop()
+            self.keyboard_listener.stop()
+            self.print_final_summary()
+
+    def print_final_summary(self):
+        """Prints the final summary of active and inactive time."""
+        total_time = self.active_time + self.inactive_time
+
+        if total_time > self.total_runtime:
+            self.active_time    = (self.active_time / total_time) * self.total_runtime
+            self.inactive_time  = self.total_runtime - self.active_time
+        elif total_time < self.total_runtime:
+            self.inactive_time += self.total_runtime - total_time
+
+        active_percent = (self.active_time / self.total_runtime) * 100
+        inactive_percent = (self.inactive_time / self.total_runtime) * 100
+
+        print(f"\nSummary:\n"
+              f"Total Time Tracked: {timedelta(seconds=int(self.total_runtime))}\n"
+              f"Active Time: {timedelta(seconds=int(self.active_time))} ({active_percent:.2f}%)\n"
+              f"Inactive Time: {timedelta(seconds=int(self.inactive_time))} ({inactive_percent:.2f}%)\n")
+
+    def create_icon(self):
+        """Creates a system tray icon with real-time active/inactive time."""
+        self.icon = pystray.Icon("inactivity_detector", self.create_icon_image())
+        threading.Thread(target=self.update_tray_time, daemon=True).start()
+        self.icon.run()
+
+    def create_icon_image(self):
+        """Creates a simple system tray icon."""
+        image   = Image.new("RGB", (64, 64), (0, 128, 255))
+        draw    = ImageDraw.Draw(image)
+        draw.rectangle((10, 10, 54, 54), fill=(255, 255, 255))
+        return image
+
+    def update_tray_time(self):
+        """Updates system tray icon title with active/inactive time."""
+        while self.running:
+            elapsed_active      = timedelta(seconds=int(self.active_time))
+            elapsed_inactive    = timedelta(seconds=int(self.inactive_time))
+            self.icon.title     = f"Active: {elapsed_active} | Inactive: {elapsed_inactive}"
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    detector = InactivityDetector(total_runtime=3600, timeout=300, check_interval=5)
+    monitor_thread = threading.Thread(target=detector.monitor)
+    monitor_thread.start()
+    detector.create_icon()
