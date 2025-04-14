@@ -1,0 +1,141 @@
+import win32evtlog
+import win32security
+import pywintypes
+import socket
+import logging
+
+class EventDetector:
+    EVENT_IDS = [4624, 4647, 4634, 6005]
+
+    def __init__(self, log_path=r"C:\InactivityService\event_detector.log", max_records=500):
+        self.hostname = socket.gethostname()
+        self.server = 'localhost'
+        self.log_type = 'Security'
+        self.max_records = max_records
+        self.EXCLUDED_USERS = self.get_system_accounts()  # Dynamic exclusion
+
+        # Add explicit exclusions here
+        self.EXCLUDED_USERS.add("ADMINISTRATOR")  # Exclude "Administrator" account
+
+        logging.basicConfig(
+            filename=log_path,
+            level=logging.INFO,
+            format="%(asctime)s - %(levelname)s - %(message)s"
+        )
+
+    @staticmethod
+    def get_system_accounts():
+        """Retrieve built-in Windows system accounts dynamically."""
+        system_accounts = set()
+
+        # Well-known SIDs for system accounts
+        WELL_KNOWN_SIDS = [
+            "S-1-5-18",  # Local System
+            "S-1-5-19",  # Local Service
+            "S-1-5-20",  # Network Service
+        ]
+
+        for sid_str in WELL_KNOWN_SIDS:
+            try:
+                sid = win32security.ConvertStringSidToSid(sid_str)
+                name, domain, _ = win32security.LookupAccountSid(None, sid)
+                system_accounts.add(name.upper())
+            except pywintypes.error:
+                pass  # Ignore errors if SID lookup fails
+
+        # Add pattern-based exclusions
+        system_accounts.update({"SYSTEM", "PIPE$", "-"})
+        
+        return system_accounts
+
+    def resolve_sid_to_username(self, sid_str):
+        """Convert a SID to a username, or return SID string if resolution fails."""
+        try:
+            sid = win32security.ConvertStringSidToSid(sid_str)
+            name, domain, _ = win32security.LookupAccountSid(None, sid)
+            return name
+        except Exception:
+            return sid_str
+
+    def parse_username(self, event):
+        """Extract username from event log based on event type."""
+        inserts = event.StringInserts
+        if not inserts:
+            return None
+
+        try:
+            username = None
+
+            if event.EventID == 4624 and len(inserts) > 5:
+                username = inserts[5].strip()
+            elif event.EventID == 4647 and len(inserts) > 1:
+                username = self.resolve_sid_to_username(inserts[1].strip())
+            elif event.EventID == 4634 and len(inserts) > 0:
+                username = self.resolve_sid_to_username(inserts[0].strip())
+            elif event.EventID == 6005:
+                username = "SYSTEM"
+
+            if username:
+                uname_upper = username.upper()
+                # Exclude dynamically retrieved system accounts, and "Administrator"
+                if (uname_upper in self.EXCLUDED_USERS or
+                    uname_upper.startswith("UMFD-") or
+                    uname_upper.startswith("DWM-")):
+                    return None
+                return username.strip()
+
+        except Exception as e:
+            logging.warning(f"Failed to parse username: {e}")
+        return None
+
+    def get_latest_user_event(self):
+        """Read Windows event logs and retrieve the most recent user logon/logoff event."""
+        try:
+            handle = win32evtlog.OpenEventLog(self.server, self.log_type)
+        except Exception as e:
+            logging.error(f"Failed to open event log: {e}")
+            return None
+
+        flags = win32evtlog.EVENTLOG_BACKWARDS_READ | win32evtlog.EVENTLOG_SEQUENTIAL_READ
+        events = []
+
+        try:
+            while len(events) < self.max_records:
+                chunk = win32evtlog.ReadEventLog(handle, flags, 0)
+                if not chunk:
+                    break
+                events.extend(chunk)
+
+            for event in events:
+                if event.EventID not in self.EVENT_IDS:
+                    continue
+
+                username = self.parse_username(event)
+                if not username or username.upper() in self.EXCLUDED_USERS:
+                    continue
+
+                event_type = {
+                    4624: "Logon",
+                    4647: "Logoff",
+                    4634: "Logoff (Session End)",
+                    6005: "Startup"
+                }.get(event.EventID, "Other")
+
+                return {
+                    "event_type": event_type,
+                    "username": username,
+                    "hostname": self.hostname,
+                    "timestamp": str(event.TimeGenerated)
+                }
+
+        except Exception as e:
+            logging.error(f"Error while scanning event log: {e}")
+
+        return None
+
+
+# Example Usage
+# detector = EventDetector()
+# event = detector.get_latest_user_event()
+# if event:
+#     print(f"{event['timestamp']} - {event['event_type']} by {event['username']} on {event['hostname']}")
