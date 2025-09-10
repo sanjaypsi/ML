@@ -1,0 +1,36 @@
+
+
+const AssetsDataTable: React.FC<AssetsDataTableProps> = ({
+  project,
+  assets,
+  tableFooter,
+  dateTimeFormat,
+}) => {
+  if (project == null) {
+    return null;
+  }
+  const { reviewInfos } = useFetchAssetReviewInfos(project, assets);
+
+  return (
+    <Table stickyHeader>
+      <RecordTableHead
+        key='asset-data-table-head'
+        columns={columns}
+      />
+      <TableBody>
+        {assets.map((asset, index) => (
+          <AssetRow
+            key={${asset.name}-${asset.relation}-${index}}
+            asset={asset}
+            reviewInfos={reviewInfos}
+            dateTimeFormat={dateTimeFormat}
+            isLastRow={(index === assets.length - 1)}
+          />
+        ))}
+      </TableBody>
+      {tableFooter || null}
+    </Table>
+  );
+};
+
+export default AssetsDataTable;
