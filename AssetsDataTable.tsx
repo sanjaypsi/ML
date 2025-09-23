@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useState, useMemo } from "react";
 import {
   Table,
   TableBody,
@@ -15,8 +15,10 @@ import {
   RecordTableHeadProps,
 } from "./types";
 import { useFetchAssetReviewInfos, useFetchAssetThumbnails } from './hooks';
+import { getSortedAssetsByName } from './AssetDataSorted';
+import useFetchAllAssets from './useFetchAllAssets';
 
-
+// ----------------- TABLE CONFIG -----------------
 const ASSET_PHASES: { [key: string]: Colors } = {
   mdl: {
     lineColor: '#3295fd',
@@ -309,30 +311,64 @@ const MultiLineTooltipTableCell: React.FC<TooltipTableCellProps> = (
   );
 };
 
-const RecordTableHead: React.FC<RecordTableHeadProps> = ({
+// ----------------- TABLE HEAD (with sort indicator & click) -----------------
+type HeadProps = {
+    columns: Column[];
+    sortColumn: string | null;
+    sortDirection: "asc" | "desc" | null;
+    onHeaderClick: (colId: string) => void;
+};
+
+const RecordTableHeadWithSort: React.FC<HeadProps> = ({
   columns,
+  sortColumn,
+  sortDirection,
+  onHeaderClick,
 }) => {
+  const dirLabel = (d: "asc" | "desc" | null) =>
+    d === "asc" ? "▲" : d === "desc" ? "▼" : "";
+
   return (
     <TableHead>
       <TableRow>
         {columns.map((column) => {
-          const borderLineStyle = column.colors ? `solid 3px ${column.colors.lineColor}` : 'none';
-          const borderTopStyle = column.colors ? borderLineStyle : 'none';
-          const borderLeftStyle = (column.id.indexOf('work_status') !== -1) ? borderLineStyle : 'none';
-          const borderRightStyle = (column.id.indexOf('submitted_at') !== -1) ? borderLineStyle : 'none';
+          const borderLineStyle = column.colors
+            ? "solid 3px " + column.colors.lineColor
+            : "none";
+          const isActive = sortColumn === column.id;
+          const label = isActive ? dirLabel(sortDirection) : "";
+
+          // NOTE: avoid setting display:flex on TableCell itself (keeps normal table layout).
+          // Use a child div for flex layout inside the cell.
           return (
             <TableCell
               key={column.id}
-              style={
-                {
-                  backgroundColor: column.colors ? column.colors.backgroundColor : 'none',
-                  borderTop: borderTopStyle,
-                  borderLeft: borderLeftStyle,
-                  borderRight: borderRightStyle,
-                }
-              }
+              onClick={() => onHeaderClick(column.id)}
+              style={{
+                backgroundColor: column.colors
+                  ? column.colors.backgroundColor
+                  : "none",
+                borderTop: borderLineStyle,
+                borderLeft:
+                  column.id.indexOf("work_status") !== -1 ? borderLineStyle : "none",
+                borderRight:
+                  column.id.indexOf("submitted_at") !== -1 ? borderLineStyle : "none",
+                cursor: "pointer",
+                userSelect: "none",
+                padding: "6px",
+                fontWeight: 500,
+                color: "#fff",
+                whiteSpace: "nowrap", // prevent line breaks inside header text
+                // DO NOT set display:'flex' here
+              }}
             >
-              {column.label}
+              {/* child div handles the horizontal layout inside the cell */}
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                <span style={{ display: "inline-block", overflow: "hidden", textOverflow: "ellipsis" }}>
+                  {column.label}
+                </span>
+                {label ? <span style={{ fontSize: 12, marginLeft: 10 }}>{label}</span> : null}
+              </div>
             </TableCell>
           );
         })}
@@ -404,39 +440,74 @@ const AssetRow: React.FC<AssetRowProps> = ({
   );
 };
 
+// ----------------- MAIN COMPONENT -----------------
 const AssetsDataTable: React.FC<AssetsDataTableProps> = ({
-  project,
-  assets,
-  tableFooter,
-  dateTimeFormat,
+    project,
+    assets,
+    tableFooter,
+    dateTimeFormat,
 }) => {
-  if (project == null) {
-    return null;
-  }
-  const { reviewInfos } = useFetchAssetReviewInfos(project, assets);
-  const { thumbnails } = useFetchAssetThumbnails(project, assets);
+    if (!project) return null;
 
-  return (
-    <Table stickyHeader>
-      <RecordTableHead
-        key='asset-data-table-head'
-        columns={columns}
-      />
-      <TableBody>
-        {assets.map((asset, index) => (
-          <AssetRow
-            key={`${asset.name}-${asset.relation}-${index}`}
-            asset={asset}
-            reviewInfos={reviewInfos}
-            thumbnails={thumbnails}
-            dateTimeFormat={dateTimeFormat}
-            isLastRow={(index === assets.length - 1)}
-          />
-        ))}
-      </TableBody>
-      {tableFooter || null}
-    </Table>
-  );
+    // console.log("Rendering AssetsDataTable with assets:", assets);
+    const { data: allAssets, isLoading, error } = useFetchAllAssets(project.key_name);
+
+    // const { reviewInfos } = useFetchAssetReviewInfos(project,  allAssets || []);
+    // const { thumbnails }  = useFetchAssetThumbnails(project, allAssets || []);
+    const { reviewInfos } = useFetchAssetReviewInfos(project, assets);
+    const { thumbnails } = useFetchAssetThumbnails(project, assets);
+
+    // ---------- SORTING ----------
+
+    const [sortColumn, setSortColumn] = useState<string | null>(null);
+    const [sortDirection, setSortDirection] = useState<"asc" | "desc" | null>(
+        null
+    );
+
+    // ---------- CHANGED: sort only the passed-in assets ----------
+    const sortedAssets = useMemo(() => {
+        return getSortedAssetsByName(assets, sortColumn, sortDirection, reviewInfos);
+    }, [assets, sortColumn, sortDirection, reviewInfos]);
+    // ----------------------------------------------------------
+    // ---------- CHANGED: toggle asc <-> desc only (no cycle to null) ----------
+    const handleHeaderClick = (colId: string) => {
+        if (!colId || colId === "thumbnail") return;
+        if (sortColumn === colId) {
+            // toggle asc <-> desc only
+            const next = sortDirection === "asc" ? "desc" : "asc";
+            setSortDirection(next);
+        } else {
+            setSortColumn(colId);
+            setSortDirection("asc");
+        }
+    };
+    // ------------------------------------------------------------------------
+
+    return (
+        <div>
+            <Table stickyHeader>
+                <RecordTableHeadWithSort
+                    columns={columns}
+                    sortColumn={sortColumn}
+                    sortDirection={sortDirection}
+                    onHeaderClick={handleHeaderClick}
+                />
+                <TableBody>
+                    {sortedAssets.map((asset: any, index: number) => (
+                        <AssetRow
+                            key={asset.name + "-" + asset.relation + "-" + index}
+                            asset={asset}
+                            reviewInfos={reviewInfos}
+                            thumbnails={thumbnails}
+                            dateTimeFormat={dateTimeFormat}
+                            isLastRow={index === sortedAssets.length - 1}
+                        />
+                    ))}
+                </TableBody>
+                {tableFooter || null}
+            </Table>
+        </div>
+    );
 };
 
 export default AssetsDataTable;
